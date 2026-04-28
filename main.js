@@ -411,6 +411,10 @@ function resize2DCanvas() {
     camera2D.top = frustumHeight / 2;
     camera2D.bottom = -frustumHeight / 2;
     camera2D.updateProjectionMatrix();
+    // Invalidation du cache pour forcer un redessin propre
+    mapCacheCanvas.width = canvas2D.width;
+    mapCacheCanvas.height = canvas2D.height;
+    isMapCached = false;
 }
 
 function updateCameras() {
@@ -994,8 +998,6 @@ function updateFrame() {
         const months = TRANSLATIONS[currentLang].months;
         if (dateDisplay) dateDisplay.innerText = `${String(d.getUTCDate()).padStart(2, '0')} ${months[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
     }
-
-    if (PARAMS.viewMode !== 0) render2D();
 }
 
 // ========================
@@ -1226,10 +1228,17 @@ function alignParticlesToFrame(frameIdx) {
         trailMesh.geometry.attributes.position.needsUpdate = true;
     }
 }
+// --- CACHE SYSTEM POUR LA CARTE 2D ---
+const mapCacheCanvas = document.createElement('canvas');
+const mapCacheCtx = mapCacheCanvas.getContext('2d', { alpha: true });
+let isMapCached = false;
+
 function render2D() {
     if (!ctx2D || canvas2D.width === 0) return;
     const W = canvas2D.width;
     const H = canvas2D.height;
+    const dpr = window.devicePixelRatio || 1;
+
     ctx2D.clearRect(0, 0, W, H);
 
     const projectToCanvas = (lat, lon) => {
@@ -1239,64 +1248,66 @@ function render2D() {
         return { x, y };
     };
 
-    // 1. DESSIN DES CÔTES
-    if (coastlinesGeoJSON) {
-        ctx2D.strokeStyle = 'rgba(255, 255, 255, 0.7)';
-        ctx2D.lineWidth = 1 * (window.devicePixelRatio || 1);
+    // --- 1. DESSIN DU FOND (CARTE + PINS) SUR LE CACHE ---
+    // Ne s'exécute qu'une seule fois, ou si la fenêtre change de taille
+    if (!isMapCached && coastlinesGeoJSON) {
+        mapCacheCtx.clearRect(0, 0, W, H);
+        
+        mapCacheCtx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+        mapCacheCtx.lineWidth = 1 * dpr;
         coastlinesGeoJSON.features.forEach(f => {
             const rings = (f.geometry.type === 'Polygon') ? [f.geometry.coordinates] : f.geometry.coordinates;
             rings.forEach(poly => poly.forEach(ring => {
-                ctx2D.beginPath();
+                mapCacheCtx.beginPath();
                 for (let n = 0; n < ring.length; n++) {
                     const pos = projectToCanvas(ring[n][1], ring[n][0]);
-                    if (n === 0) ctx2D.moveTo(pos.x, pos.y);
+                    if (n === 0) mapCacheCtx.moveTo(pos.x, pos.y);
                     else {
                         let currL = ((ring[n][0] % 360) + 360) % 360;
                         let prevL = ((ring[n - 1][0] % 360) + 360) % 360;
-                        if (Math.abs(currL - prevL) > 180) ctx2D.moveTo(pos.x, pos.y);
-                        else ctx2D.lineTo(pos.x, pos.y);
+                        if (Math.abs(currL - prevL) > 180) mapCacheCtx.moveTo(pos.x, pos.y);
+                        else mapCacheCtx.lineTo(pos.x, pos.y);
                     }
                 }
-                ctx2D.stroke();
+                mapCacheCtx.stroke();
             }));
         });
+
+        markers.forEach(m => {
+            const { lat, lon, labelText, isPrimary } = m.userData;
+            const pos = projectToCanvas(lat, lon);
+            mapCacheCtx.beginPath();
+            mapCacheCtx.arc(pos.x, pos.y, (isPrimary ? 4 : 2.5) * dpr, 0, 2 * Math.PI);
+            mapCacheCtx.fillStyle = '#ffff00';
+            mapCacheCtx.fill();
+            mapCacheCtx.font = `${isPrimary ? 'bold' : 'normal'} ${11 * dpr}px Inter, sans-serif`;
+            mapCacheCtx.textAlign = 'center';
+            mapCacheCtx.textBaseline = 'bottom';
+            mapCacheCtx.strokeStyle = '#000';
+            mapCacheCtx.lineWidth = 3 * dpr;
+            mapCacheCtx.strokeText(labelText, pos.x, pos.y - 5 * dpr);
+            mapCacheCtx.fillStyle = '#fff';
+            mapCacheCtx.fillText(labelText, pos.x, pos.y - 5 * dpr);
+        });
+
+        isMapCached = true;
     }
 
-    // 2. DESSIN DES PINS ET NOMS DES VILLES
-    const dpr = window.devicePixelRatio || 1;
-    markers.forEach(m => {
-        const { lat, lon, labelText, isPrimary } = m.userData;
-        const pos = projectToCanvas(lat, lon);
+    // On colle la "photo" pré-calculée à 60 FPS (coût CPU quasi-nul)
+    if (isMapCached) {
+        ctx2D.drawImage(mapCacheCanvas, 0, 0);
+    }
 
-        // Point jaune
-        ctx2D.beginPath();
-        const radius = (isPrimary ? 4 : 2.5) * dpr;
-        ctx2D.arc(pos.x, pos.y, radius, 0, 2 * Math.PI);
-        ctx2D.fillStyle = '#ffff00';
-        ctx2D.fill();
-
-        // TEXTE : Nom de la ville
-        ctx2D.font = `${isPrimary ? 'bold' : 'normal'} ${11 * dpr}px Inter, sans-serif`;
-        ctx2D.textAlign = 'center';
-        ctx2D.textBaseline = 'bottom';
-
-        // Contour noir pour la lisibilité
-        ctx2D.strokeStyle = '#000';
-        ctx2D.lineWidth = 3 * dpr;
-        ctx2D.strokeText(labelText, pos.x, pos.y - 5 * dpr);
-
-        // Texte blanc
-        ctx2D.fillStyle = '#fff';
-        ctx2D.fillText(labelText, pos.x, pos.y - 5 * dpr);
-    });
-
-    // 3. DESSIN DES TRAITS DE VENT
+    // --- 2. DESSIN DU VENT (DYNAMIQUE) ---
     const aU2D = isLocalData ? localBufferU : archiveBufferU;
     const aV2D = isLocalData ? localBufferV : archiveBufferV;
 
     if (PARAMS.showWind && aU2D && aV2D) {
         ctx2D.lineCap = 'round';
-        for (let i = 0; i < N_PARTICLES; i++) {
+        const max2DParticles = Math.min(N_PARTICLES, 800); 
+        const max2DTrail = 12; 
+
+        for (let i = 0; i < max2DParticles; i++) {
             const [u, v] = getWindAtPos(pLat[i], pLon[i], PARAMS.currentFrame, aU2D, aV2D);
             const speed = Math.hypot(u, v);
             const sf = Math.max(0.05, Math.min(1.0, speed / 25.0));
@@ -1307,7 +1318,7 @@ function render2D() {
             let prevX = -1;
             let started = false;
 
-            for (let t = 0; t < TRAIL_LEN; t++) {
+            for (let t = 0; t < max2DTrail; t++) {
                 const pos = projectToCanvas(cLat, cLon);
                 if (!started) {
                     ctx2D.moveTo(pos.x, pos.y);
@@ -1320,12 +1331,20 @@ function render2D() {
 
                 const [up, vp] = getWindAtPos(cLat, cLon, PARAMS.currentFrame, aU2D, aV2D);
                 const cosLat = Math.max(0.05, Math.cos(cLat * Math.PI / 180));
-                cLon -= up * WIND_SCALE / cosLat;
-                cLat -= vp * WIND_SCALE;
+                
+                // Le pas est artificiellement allongé pour garder un beau visuel malgré la réduction des calculs
+                cLon -= up * WIND_SCALE * 2.0 / cosLat; 
+                cLat -= vp * WIND_SCALE * 2.0;
             }
 
             ctx2D.lineWidth = 1.2 * dpr;
-            ctx2D.strokeStyle = `rgba(255, 255, 255, ${sf})`;
+            
+            // NOUVEAU : Colorisation dynamique du vent (Bleu -> Violet -> Rouge -> Jaune)
+            const r = Math.floor(255 * sf);
+            const g = Math.floor(255 * Math.pow(sf, 2)); 
+            const b = Math.floor(255 * (1 - sf));
+            ctx2D.strokeStyle = `rgba(${r}, ${g}, ${b}, ${sf + 0.2})`;
+            
             ctx2D.stroke();
         }
     }
@@ -1773,6 +1792,7 @@ function animateLoop(t) {
     // Cela libère énormément de puissance processeur pour que le mode Comparative reste fluide.
     if (t - lastWindTime > 33) {
         updateParticles(PARAMS.currentFrame, _doAdvance);
+        if (PARAMS.viewMode !== 0) render2D(); // NOUVEAU : La 2D est dessinée en flux continu
         lastWindTime = t;
     }
 
